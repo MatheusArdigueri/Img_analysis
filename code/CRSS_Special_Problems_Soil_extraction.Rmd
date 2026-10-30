@@ -1,0 +1,48 @@
+---
+title: "Soil Extraction"
+author: "Matheus Ardigueri"
+date: "2026-08-26"
+output: html_document
+---
+
+# Loading Packages
+
+```{r message=FALSE, warning=FALSE}
+library(ggplot2)
+library(tidyverse)
+library(janitor)
+library(dplyr)
+library(FIELDimageR)
+library(FIELDimageR.Extra)
+library(randomForest)
+library(stars)
+library(EBImage)
+library(raster)
+library(terra)
+```
+
+# Band Stack Cameras Without blue
+
+```{r}
+rem_soil <- rast("../output/082520_extracted/082520_plant_only_reflectance.tif")
+rem_soil
+
+```
+```{r}
+plots <- read_sf("../data/Plots/20/2020_chiara_plots_projected.shp")
+plots
+```
+
+
+```{r}
+indices <- fieldIndex(mosaic = rem_soil,
+                      Red = 2, Green = 1,
+                      index = c())
+
+```
+```{r}
+
+```
+
+
+

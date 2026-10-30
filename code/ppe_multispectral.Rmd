@@ -1,0 +1,80 @@
+---
+title: "ppe_soilextraction"
+author: "Matheus Ardigueri"
+date: "2026-10-12"
+output: html_document
+---
+
+# EDIT THESE SETTINGS. Paths use forward slashes on Windows.
+# ```{r}
+# workflow_folder <- 'code'
+# source(file.path(workflow_folder, '../code/common.R'))
+# band_dir <- '../data/060220/'
+# output_dir <- '../output/060220_extracted/'
+# dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+# ```
+
+```{r}
+# Choose a drive with plenty of free disk space
+raster_temp <- "D:/R_terra_temp"
+
+dir.create(raster_temp, recursive = TRUE, showWarnings = FALSE)
+
+terra::terraOptions(
+  tempdir = raster_temp,
+  memfrac = 0.5
+)
+
+# Check where temporary rasters will be stored
+terra::terraOptions()
+```
+
+
+```{r}
+# Load common.R from the current code folder
+source("common.R")
+
+# Go up one level to access data and output
+band_dir <- "../data/082520"
+output_dir <- "../output/082520_extracted"
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+# Keys are important: use 're' for red-edge, not 'rededge'.
+# Parrot Sequoia/no-blue imagery: DELETE the blue line; do not create a fake band.
+# Use your actual processed REFLECTANCE orthomosaic filenames.
+```{r}
+band_paths <- c(
+  green = file.path(band_dir, "08_25_20_transparent_reflectance_green.tif"),
+  red   = file.path(band_dir, "08_25_20_transparent_reflectance_red.tif"),
+  re    = file.path(band_dir, "08_25_20_transparent_reflectance_red edge.tif"),
+  nir   = file.path(band_dir, "08_25_20_transparent_reflectance_nir.tif")
+)
+# blue  = file.path(band_dir, 'blue.tif')
+```
+
+# Set from export metadata: 1 for reflectance 0-1; 10000 if scaled by 10000.
+# Do not infer the divisor solely from an image's maximum value.
+```{r}
+reflectance_divisor <- 1
+align_bands <- FALSE
+plant_threshold <- 0.4 # starting value only: inspect soil, shadows and leaf edges
+plots_file <- NULL # optional: 'C:/your/path/Ponder_shape_projected.shp'
+plot_id <- 'plot' # exact column name in polygon attributes
+```
+
+
+```{r}
+stack_path <- file.path(output_dir, 'reflectance_stack.tif')
+stack <- build_stack(band_paths, stack_path, reflectance_divisor, align_bands)
+# Normalize explicitly above; disable package automatic rescaling.
+imp <- ppe_import(stack_path, ortho_type = 'ms',
+                  band_names = setNames(seq_along(band_paths), names(band_paths)),
+                  normalize = 'false', outfile = file.path(output_dir, 'ppe_work'))
+result <- run_ppe(imp, stack, output_dir, plant_threshold, plots_file, plot_id)
+```
+
+# result$plant_tiff is the file to open in QGIS or copy/share.
+# R exports it to disk; it does not need to be downloaded from an online service.
+
