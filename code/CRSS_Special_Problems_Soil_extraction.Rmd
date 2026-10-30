@@ -16,33 +16,387 @@ library(FIELDimageR)
 library(FIELDimageR.Extra)
 library(randomForest)
 library(stars)
+library(pliman)
 library(EBImage)
+library(ppe)
 library(raster)
 library(terra)
 ```
 
-# Band Stack Cameras Without blue
+------------------------------------------------------------------------------------------------------------------
+
+# Removing soil using PPE package extension.
+
+## Setting disk space to storage temporary folders.
 
 ```{r}
-rem_soil <- rast("../output/082520_extracted/082520_plant_only_reflectance.tif")
+# Choose a drive with plenty of free disk space
+raster_temp <- "D:/R_terra_temp"
+
+dir.create(raster_temp, recursive = TRUE, showWarnings = FALSE)
+
+terra::terraOptions(
+  tempdir = raster_temp,
+  memfrac = 0.9
+)
+
+# Check where temporary rasters will be stored
+terra::terraOptions()
+```
+
+## function to run PPE automatically and save outputs.
+
+```{r}
+
+stopifnot(as.character(packageVersion('ppe')) == '0.2.3')
+ppe_options(sample_n = 30000, threads = 2, seed = 42)
+
+save_tif <- function(x, path) {
+  writeRaster(x, path, overwrite = TRUE, datatype = 'FLT4S',
+              gdal = c('COMPRESS=LZW', 'TILED=YES', 'BIGTIFF=IF_SAFER'))
+  rast(path)
+}
+
+# Band stacking: explicit order, single-band inputs, identical grids.
+# Alignment is optional because resampling cannot correct poor coregistration.
+build_stack <- function(paths, out, divisor = 1, align = FALSE) {
+  stopifnot(length(paths) > 1, all(file.exists(paths)),
+            is.finite(divisor), divisor > 0)
+  layers <- lapply(paths, rast)
+  if (any(vapply(layers, terra::nlyr, numeric(1)) != 1))    
+    stop('Each input must contain exactly one reflectance band.')
+  template <- layers[[1]]
+  if (!nzchar(crs(template))) stop('Input has no CRS. Fix georeferencing first.')
+  for (i in seq_along(layers)) {
+    if (!compareGeom(template, layers[[i]], stopOnError = FALSE)) {
+      if (!align) stop('Grid mismatch in ', paths[i],
+                      '. Inspect alignment, or explicitly set align = TRUE.')
+      layers[[i]] <- if (!same.crs(layers[[i]], template)) {
+        project(layers[[i]], template, method = 'bilinear')
+      } else resample(layers[[i]], template, method = 'bilinear')
+    }
+  }
+  # Combine bands into one SpatRaster
+  x <- layers[[1]]
+  
+  for (i in seq.int(2, length(layers))) {
+    x <- c(x, layers[[i]])
+  }
+  
+  # Convert stored values to reflectance
+  x <- x / divisor
+  names(x) <- names(paths)
+  # Input nodata must already be correctly encoded. Never blanket-mask zeros:
+  # a zero in one band can be a valid reflectance observation.
+  save_tif(x, out)
+}
+
+# Same package ensemble for both sensor types. No XGBoost installation needed.
+# All available indices are computed, but only selected layers segment the image.
+run_ppe <- function(imp, full_stack, output_dir, plant_threshold = 0.4,
+                    plots_file = NULL, plot_id = 'plot') {
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  catalog <- ppe_list_vis(imp)
+  write.csv(catalog, file.path(output_dir, 'index_formulas_and_availability.csv'),
+            row.names = FALSE)
+  available <- catalog$vi[catalog$available]
+  vi <- ppe_compute_vis(imp, available,
+                        outfile = file.path(output_dir, 'all_indices.tif'))
+  spread <- ppe_spread(imp, include_vis = TRUE)
+  write.csv(data.frame(layer = names(spread$spreads),
+                       spread = unname(spread$spreads),
+                       spread_class = unname(spread$spread_class)),
+            file.path(output_dir, 'sample_spread.csv'), row.names = FALSE)
+  write.csv(spread$correlation, file.path(output_dir, 'sample_correlation.csv'))
+  selection <- ppe_select(imp, spread = spread, vi = TRUE, bands = TRUE,
+                          top_n = 6, max_correlation = 0.7)
+  # Supply only selected indices: avoids duplicated/unneeded segmentation layers.
+  selected_vis <- intersect(selection$chosen, available)
+  selected_stack <- if (length(selected_vis)) {
+    ppe_compute_vis(imp, selected_vis,
+                   outfile = file.path(output_dir, 'segmentation_indices.tif'))
+  } else NULL
+  seg <- ppe_segment(imp, selection, vi_stack = selected_stack,
+                     strict_bimodality = FALSE)
+  votes <- ppe_vote_fractions(seg)
+  ppe_vote_threshold_guide(votes) # inspect before choosing a threshold
+  mask <- ppe_create_mask(votes, plant_thresh = plant_threshold,
+                          import = imp, ambiguous = 'na')
+  # Conservative handling: uncertain pixels remain NA, rather than forced to soil.
+  # Package mask: 1=plant, 0=soil, NA=uncertain/nodata.
+  save_tif(mask$mask, file.path(output_dir, 'plant_soil_labels.tif'))
+  save_tif(votes$fraction, file.path(output_dir, 'plant_vote_fraction.tif'))
+  # Retain ORIGINAL reflectance layers, including EVERY HSI band.
+  # The condition is applied to the whole stack; no soil is filled with zero.
+  plant_path <- file.path(output_dir, 'plant_only_reflectance.tif')
+  soil_path <- file.path(output_dir, 'soil_only_reflectance.tif')
+  plant <- save_tif(ifel(mask$mask == 1, full_stack, NA), plant_path)
+  save_tif(ifel(mask$mask == 0, full_stack, NA), soil_path)
+  plant_vis <- ppe_apply_mask(imp, mask, vi_names = available,
+                 outfile = file.path(output_dir, 'plant_only_all_indices.tif'))
+  # Image-wide descriptive statistics (not classification accuracy).
+  tab <- global(plant_vis$raster, c('mean', 'sd', 'min', 'max'), na.rm = TRUE)
+  tab$index <- rownames(tab)
+  write.csv(tab, file.path(output_dir, 'plant_index_summary.csv'), row.names = FALSE)
+  write.csv(as.data.frame(freq(mask$mask)),
+            file.path(output_dir, 'classified_pixel_counts.csv'), row.names = FALSE)
+  qc <- ppe_qc(imp, votes = votes)
+  write.csv(qc$summary, file.path(output_dir, 'brightness_vote_QC.csv'), row.names = FALSE)
+  # Optional: all SIX package plot statistics + canopy cover.
+  if (!is.null(plots_file)) {
+    if (!file.exists(plots_file)) stop('Plot polygon file does not exist.')
+    plot_summary <- ppe_summarize_plots(plots_file, mask = mask, vi_stack = vi,
+      id_field = plot_id, vi_scope = 'plant',
+      stats = c('mean', 'median', 'max', 'sd', 'cv', 'min'),
+      outfile = file.path(output_dir, 'plot_metrics.csv'))
+  }
+  # Preserve all package diagnostics, including segmentation and selection.
+  saveRDS(list(spread = spread, selection = selection, segmentation = seg,
+               votes = votes, mask = mask, qc = qc),
+          file.path(output_dir, 'package_diagnostics.rds'))
+  capture.output(sessionInfo(), file = file.path(output_dir, 'sessionInfo.txt'))
+  ppe_plot_mask(imp, mask)
+  message('Plant-only GeoTIFF saved to: ', normalizePath(plant_path))
+  invisible(list(import = imp, mask = mask, plant = plant, indices = plant_vis,
+                 votes = votes, diagnostics = qc, plant_tiff = plant_path))
+}
+```
+
+## Look for imput and output directories
+
+```{r}
+
+# Go up one level to access data and output
+band_dir <- "../data/061821/"
+output_dir <- "../output/061821_extracted"
+
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Selecting band files
+
+```{r}
+
+# Keys are important: use 're' for red-edge, not 'rededge'.
+# Parrot Sequoia/no-blue imagery: DELETE the blue line; do not create a fake band.
+# Use your actual processed REFLECTANCE orthomosaic filenames.
+
+band_paths <- c(
+  blue = file.path(band_dir, '061821_Process2_transparent_reflectance_blue.tif'),
+  green = file.path(band_dir, "061821_Process2_transparent_reflectance_green.tif"),
+  red   = file.path(band_dir, "061821_Process2_transparent_reflectance_red.tif"),
+  re    = file.path(band_dir, "061821_Process2_transparent_reflectance_red edge.tif"),
+  nir   = file.path(band_dir, "061821_Process2_transparent_reflectance_nir.tif")
+)
+
+# Bandstack will have B,G,R,RE,NIR order, and it will be names ad lyr1,2,3,4 ...
+
+# blue  = file.path(band_dir, 'blue.tif')
+```
+
+
+```{r}
+
+# Set from export metadata: 1 for reflectance 0-1; 10000 if scaled by 10000.
+# Do not infer the divisor solely from an image's maximum value.
+
+reflectance_divisor <- 1
+align_bands <- FALSE
+plant_threshold <- 0.4 # starting value only: inspect soil, shadows and leaf edges
+plots_file <- NULL # optional: 'C:/your/path/Ponder_shape_projected.shp'
+plot_id <- 'plot' # exact column name in polygon attributes
+```
+
+
+```{r}
+stack_path <- file.path(output_dir, 'reflectance_stack.tif')
+stack <- build_stack(band_paths, stack_path, reflectance_divisor, align_bands)
+# Normalize explicitly above; disable package automatic rescaling.
+imp <- ppe_import(stack_path, ortho_type = 'ms',
+                  band_names = setNames(seq_along(band_paths), names(band_paths)),
+                  normalize = 'false', outfile = file.path(output_dir, 'ppe_work'))
+result <- run_ppe(imp, stack, output_dir, plant_threshold, plots_file, plot_id)
+```
+
+------------------------------------------------------------------------------------------------------------------
+
+# Use soil removed already bands
+
+## Band stack cameras without blue  
+
+```{r}
+rem_soil <- rast("../output/081020_extracted/")
 rem_soil
 
 ```
+
+## Band Stack Cameras with blue.
+
+## Importing experimental plots
+
 ```{r}
-plots <- read_sf("../data/Plots/20/2020_chiara_plots_projected.shp")
+plots <- terra::vect("../data/Plots/20/2020_chiara_plots_projected.shp")
+plots <- terra::project(plots, crs(rem_soil))
 plots
 ```
 
+## checking plot original IDs
 
 ```{r}
-indices <- fieldIndex(mosaic = rem_soil,
-                      Red = 2, Green = 1,
-                      index = c())
+# Check the original polygon order
+plots_df <- as.data.frame(plots)
+
+plots_df %>%
+  mutate(ID = row_number()) %>%
+  dplyr::select(ID, id, trt, genotype)
+```
+
+
+## Checking available indices to calculate based on sensor
+
+```{r}
+# Change band avaliability based on sensor.
+
+available_bands <- c("R", "G", "RE", "NIR")
+
+computable_indices <- pliman_indexes_ican_compute(available_bands)
+computable_indices$Index
 
 ```
+## Calculating vegetation indices
+
+```{r}
+indices <- mosaic_index(mosaic = rem_soil,
+                        index = c(
+  "ARI",    "BAI",    "CCCI",   "CIG",    "CIRE",
+  "CVI",    "GDVI",   "GEMI",   "GNDVI",  "GOSAVI",
+  "GRVI",   "GSAVI",  "IPVI",   "MCARI1", "MCARI2",
+  "MSAVI",  "MSAVI2", "MSR",    "NDRE",   "NDVI",
+  "NDWI",   "NIR",    "NLI",    "OSAVI",  "PSRI",
+  "RDVI",   "RE",     "REDVI",  "RESR",   "RVI",
+  "SAVI2",  "TCARI",  "TDVI",   "TSAVI",  "TVI",
+  "VIG",    "VIN",    "VIRE",   "WDRVI",  "WSI",
+  "ERVI",   "G",      "GR",     "MGVRI",  "NGRDI",
+  "R",      "SAVI",   "SCI",    "GRVI2",  "NDI"
+),
+                        r = 2,
+                        g = 1,
+                        b = NA,
+                        re = 3,
+                        nir = 4,
+                        plot = TRUE,
+                        verbose = TRUE
+                            
+)
+```
+
+## Extracting indices mean based on the plots and the indices calculations
+
+```{r}
+indices_mean <- terra::extract(
+  indices,
+  plots,
+  fun = mean,
+  na.rm = TRUE
+)
+
+indices_mean
+```
+
+## Convertin plots to DF and left_joining plots + indices mean
+
+```{r}
+# 1. Convert SpatVector to dataframe without geometry
+plots_df <- as.data.frame(plots)
+
+# 2. Create an ID matching terra::extract()
+plots_df <- plots_df %>%
+  mutate(ID = row_number())
+
+# 3. Join plot attributes with extracted indices
+indices_mean_joint <- indices_mean %>%
+  left_join(plots_df, by = "ID")
+
+indices_mean_joint
+```
+
+## Exporting table of date 
+
 ```{r}
 
+write.csv(indices_mean_joint, 
+          file = "../output/table_indices_extracted/080420_indices_mean.csv")
+  
 ```
 
 
+
+# Loading folder with CSV data.
+
+## Loading folder, choosing columns to match, importing all data and joining datasets.
+
+```{r}
+
+
+# 1. Define input folder
+input_dir <- "../output/table_indices_extracted/"
+
+# 2. List all CSV files
+csv_files <- list.files(
+  path = input_dir,
+  pattern = "\\.csv$",
+  full.names = TRUE,
+  recursive = TRUE
+)
+
+# 3. Import CSV files and identify their source
+data_list <- csv_files %>%
+  set_names(tools::file_path_sans_ext(basename(.))) %>%
+  map(~ read_csv(.x, show_col_types = FALSE))
+
+# 4. Combine all datasets vertically
+indices_combined <- bind_rows(
+  data_list,
+  .id = "dataset_name"
+)
+
+# 5. Organize columns
+indices_combined <- indices_combined %>%
+  relocate(dataset_name)
+
+# 6. Inspect results
+glimpse(indices_combined)
+View(indices_combined)
+
+# 7. Save combined dataset
+write_csv(
+  indices_combined,
+  "../output/Combined_Vegetation_Indices.csv"
+)
+```
+
+
+##
+
+```{r}
+
+
+
+```
+
+
+
+# Initiating data analysis
+
+## Ploting outliers.
+
+```{r}
+
+
+
+time_series_plot <- ggplot(indices_mean_joint,
+                           aes())
+
+
+```
 
